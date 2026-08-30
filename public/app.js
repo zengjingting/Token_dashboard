@@ -1,3 +1,7 @@
+// app.js
+// 仪表盘主前端：i18n 切换、SSE 实时连接、统计卡片、token/模型/项目图表、会话列表。
+// 依赖 history.js 暴露的 openHistorySession() 函数实现跨标签页跳转。
+
 // ── i18n ──────────────────────────────────────────────────────────────────
 const T = {
   zh: {
@@ -69,6 +73,7 @@ function setLang(l) {
   if (lastReport) renderReport(lastReport);
 }
 
+// 将 T[lang] 中的文本批量写入对应 ID 的 DOM 元素。
 function applyStaticLabels() {
   const L = T[lang];
   ['hTitle','pb-5h','pb-1d','pb-3d','pb-7d','pb-custom',
@@ -103,6 +108,8 @@ let currentPeriod = '1d';
 let tokenChart = null, modelChart = null;
 let es = null, lastReport = null;
 let overlayTimer = null;
+
+// 每条记录描述一个 token 图表系列：从 daily 行中取哪个字段、颜色、标签 key、tooltip key。
 const TOKEN_SERIES_META = [
   { key: 'claudeIn',    labelKey: 'dsClaudeIn',    color: 'rgba(217,119,87,0.85)', tipKey: null,                   valueOf: r => r.claude?.inputTokens || 0 },
   { key: 'claudeOut',   labelKey: 'dsClaudeOut',   color: 'rgba(180,85,50,0.8)',   tipKey: null,                   valueOf: r => r.claude?.outputTokens || 0 },
@@ -152,6 +159,7 @@ function shortSession(id) {
   return (id || '').split('/').pop()?.slice(-14) || (id || '').slice(-14) || '—';
 }
 
+// HTML 转义，防止拼接 innerHTML 时出现 XSS
 function escHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -161,6 +169,7 @@ function escHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+// 从 localStorage 读取用户为 session 设置的自定义名称。
 function getStoredSessionTitle(sessionId) {
   if (!sessionId) return '';
   try {
@@ -170,12 +179,14 @@ function getStoredSessionTitle(sessionId) {
   }
 }
 
+// Codex session ID 形如 "subdir/uuid"，取最后一段作为显示/复制用的终端 ID。
 function terminalSessionId(sessionId, source) {
   if ((source || 'claude') !== 'codex') return sessionId;
   const tail = String(sessionId || '').split('/').filter(Boolean).pop();
   return tail || sessionId;
 }
 
+// 切换到 History 标签页并跳转到指定会话（由仪表盘会话列表中的行触发）。
 async function jumpToHistorySession({ id, source, projectDir }) {
   if (!id) return;
   switchView('history');
@@ -185,6 +196,7 @@ async function jumpToHistorySession({ id, source, projectDir }) {
 }
 
 // ── Render stats ──────────────────────────────────────────────────────────
+// 填充四个统计卡片（总 token、总费用、缓存命中率、模型数）。
 function renderStats(report) {
   const s = report.summary;
   document.getElementById('sTokens').textContent    = fmt(s.totalTokens);
@@ -221,11 +233,13 @@ function calcVisibleMax(datasets) {
   return max;
 }
 
+// 切换系列可见性后重新计算 y 轴最大值，防止隐藏大系列后刻度失真。
 function applyTokenYAxisScale(chart) {
   const max = calcVisibleMax(chart.data.datasets);
   chart.options.scales.y.max = max > 0 ? Math.ceil(max * 1.1) : 1;
 }
 
+// 渲染系列可见性勾选控件，每次图表重建后调用一次。
 function renderTokenSeriesControls() {
   const wrap = document.getElementById('tokenSeriesControls');
   if (!wrap || !tokenChart) return;
@@ -262,6 +276,8 @@ function renderTokenSeriesControls() {
   });
 }
 
+// 渲染每日（或 5h 时按小时）token 分布柱状图。
+// 每次调用前先销毁旧实例，避免 Chart.js canvas 重用报错。
 function renderTokenChart(report) {
   const panel = document.getElementById('tokenChartPanel');
   if (!report.daily?.length) { panel.style.display = 'none'; return; }
@@ -299,6 +315,7 @@ function renderTokenChart(report) {
 }
 
 // ── Render model doughnut ─────────────────────────────────────────────────
+// 渲染模型费用甜甜圈图。cost 为 0 时（Codex 场景）降级使用 totalTokens 作为权重。
 function renderModelChart(report) {
   if (!report.models.length) return;
   if (modelChart) modelChart.destroy();
@@ -327,6 +344,7 @@ function renderModelChart(report) {
 }
 
 // ── Render session table ──────────────────────────────────────────────────
+// 渲染会话列表（最多 50 条）。点击行跳转到 History 标签页对应会话。
 function renderSessions(report) {
   const tbody = document.getElementById('sessionBody');
   if (!report.sessions?.length) {
@@ -389,6 +407,8 @@ function renderReport(report) {
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────
+// 打开 SSE 连接，接收服务端每 30 秒推送的 UsageReport 并渲染。
+// 切换时间段时先关闭旧连接再重新连接，避免并发推送。
 function connect(period, since, until) {
   if (es) { es.close(); es = null; }
   showOverlay();
@@ -448,6 +468,7 @@ document.querySelectorAll('.stat-info-icon').forEach(icon => {
 
 // ── Sidebar navigation ─────────────────────────────────────────────────────
 let currentView = 'dashboard';
+// 切换可见的视图面板（dashboard/history），同时更新侧边栏高亮状态。
 function switchView(viewName) {
   currentView = viewName;
   document.querySelectorAll('.view-pane').forEach(el => el.classList.remove('active'));
@@ -469,6 +490,7 @@ document.querySelectorAll('.nav-item').forEach(btn => {
   btn.addEventListener('click', () => switchView(btn.dataset.view));
 });
 
+// 监听 History 标签页的自定义标题更新事件，同步刷新仪表盘会话列表中的显示名
 window.addEventListener('session-title-updated', () => {
   if (lastReport) renderSessions(lastReport);
 });
@@ -477,6 +499,7 @@ window.addEventListener('session-title-updated', () => {
 let projectChartInst = null;
 let projectChartLoading = false;
 
+// 请求项目统计数据并渲染水平柱状图，内置防重入锁避免并发加载。
 async function loadProjectChart() {
   if (projectChartInst || projectChartLoading) return;
   projectChartLoading = true;

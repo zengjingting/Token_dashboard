@@ -62,14 +62,17 @@ test('buildReportFromHourly summary exposes claudeCost, codexCost, claudeCacheRe
   assert.equal(report.summary.cacheReadTokens, 1500); // claude 1000 + codex 500
 });
 
-test('buildReportFromCLI sessions: Claude IDs derive from UUID sessionId/projectPath and drop aggregate rows', () => {
+test('buildReportFromCLI sessions: Claude IDs derive from UUID sessionId/projectPath; project-dir IDs accepted', () => {
+  // ccusage session --json returns project-dir paths as sessionId when it aggregates by project
+  // (e.g. "-Users-x-projA"). These rows are now kept so they appear in the dashboard session
+  // list — previously they were silently dropped, causing no Claude sessions to show for 1d/3d/7d.
   const report = buildReportFromCLI({
     period: '1d',
     claudeDaily: SAMPLE_CLAUDE_DAILY,
     codexDaily: SAMPLE_CODEX_DAILY,
     claudeSessions: {
       sessions: [
-        // project aggregate row (no concrete session UUID) -> should be filtered out
+        // project-dir aggregate row -> accepted (shows project-level usage in session list)
         {
           sessionId: '-Users-x-projA',
           projectPath: 'Unknown Project',
@@ -111,7 +114,8 @@ test('buildReportFromCLI sessions: Claude IDs derive from UUID sessionId/project
   });
 
   const claudeSessions = report.sessions.filter((s) => s.source === 'claude');
-  assert.equal(claudeSessions.length, 2, 'aggregate row should be dropped');
+  assert.equal(claudeSessions.length, 3, 'all three rows should be kept');
+  assert.ok(claudeSessions.some((s) => s.id === '-Users-x-projA'), 'project-dir row kept');
   assert.ok(claudeSessions.some((s) => s.id === '61003f6b-9375-425b-9d58-90b0bb19980e'));
   assert.ok(claudeSessions.some((s) => s.id === '8996f841-4ed7-4b99-a036-6db0d79c7fa4'));
 });

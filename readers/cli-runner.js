@@ -1,3 +1,6 @@
+// readers/cli-runner.js
+// 封装 ccusage 和 ccusage-codex 命令行工具，供 1d / 3d / 7d / custom 时间段使用。
+// 通过 spawnSync 同步调用，返回解析后的 JSON 对象。
 import { spawnSync } from 'child_process';
 
 // Absolute paths — required for launchd (runs with minimal PATH, no shell profile)
@@ -21,6 +24,8 @@ function toISODate(date) {
   return `${y}-${m}-${d}`;
 }
 
+// 以 `node <bin> ...args --json` 方式同步调用 CLI 工具，返回解析后的 JSON。
+// 非零退出码或 JSON 解析失败时抛出异常。
 function run(bin, args) {
   // Invoke as `node <script> ...args` so the shebang env-lookup is bypassed
   const result = spawnSync(NODE, [bin, ...args, '--json'], {

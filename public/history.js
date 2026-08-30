@@ -1,4 +1,4 @@
-// history.js — History tab: session list, viewer, search, export
+// history.js — History 标签页：会话列表、会话查看器、全文搜索、Markdown 导出
 
 let historyLoaded = false;
 let historyLoadPromise = null;
@@ -17,6 +17,7 @@ function projectMergeKey(project) {
   return `raw:${String(project?.dirName || '').toLowerCase()}`;
 }
 
+// 合并同名项目（服务端合并后仍可能有残余重复），将其 sessions 合入同一组并重新排序。
 function mergeProjectsByLetters(projects) {
   const merged = new Map();
   for (const proj of (projects || [])) {
@@ -94,6 +95,7 @@ function sessionKey(session) {
   return `${session?.source || 'claude'}::${session?.id || ''}`;
 }
 
+// Codex session ID 为相对路径（如 "subdir/uuid"），取最后一段作为终端 ID 用于显示/复制。
 function terminalSessionId(sessionId, source) {
   if ((source || 'claude') !== 'codex') return sessionId;
   const tail = String(sessionId || '').split('/').filter(Boolean).pop();
@@ -112,6 +114,7 @@ function findSessionMeta(sessionId, source) {
   return null;
 }
 
+// 对搜索结果排序：自定义标题匹配的结果优先浮出，其次按最近活动时间降序。
 function sortSearchResults(results, query) {
   const q = query.trim().toLowerCase();
   return [...results].sort((a, b) => {
@@ -198,6 +201,7 @@ function renderSessionItem(s) {
         </div>
         <div class="session-meta">
           <span class="badge badge-${esc(source)} badge-mini">${esc(source).toUpperCase()}</span>
+          ${fmtOrigin(s.originSource) ? `<span class="origin-label">${esc(fmtOrigin(s.originSource))}</span>` : ''}
           <span>${ts}</span>
           <span>${fmtK(tokens)} tok</span>
           <span>$${(s.totalCost||0).toFixed(4)}</span>
@@ -230,6 +234,17 @@ function fmtK(n) {
   return String(n);
 }
 
+const ORIGIN_LABEL_MAP = {
+  'cli': 'CLI', 'codex-tui': 'CLI',
+  'claude-vscode': 'VSCode', 'codex_vscode': 'VSCode',
+  'claude-desktop': 'Desktop', 'Codex Desktop': 'Desktop',
+  'sdk-cli': 'SDK',
+};
+function fmtOrigin(originSource) {
+  return ORIGIN_LABEL_MAP[originSource] || '';
+}
+
+// HTML 转义，防止 innerHTML 拼接时的 XSS
 function esc(str) {
   return String(str ?? '')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -313,6 +328,8 @@ async function selectSession(projectDir, sessionId, source, opts = {}) {
   }
 }
 
+// 打开会话内搜索面板并预填 query，可选跳转到第一个匹配位置。
+// 从全局搜索结果跳转到某会话时调用，使关键词高亮立即可见。
 function openInSessionSearchWithQuery(query, jumpFirstMatch = false) {
   if (!viewerSession) return;
   const q = String(query || '').trim();
@@ -385,6 +402,8 @@ function resetInSessionSearch() {
   };
 }
 
+// 将 query 匹配内容包裹在 <mark> 中，text 和 query 都先经 HTML 转义，
+// 确保替换后插入 innerHTML 不引入 XSS 风险。
 function highlightText(text, query) {
   if (!query) return esc(text);
   const escapedQuery = esc(query);
@@ -499,7 +518,7 @@ function updateLoadMoreButton() {
 function triggerMessageFlash(target) {
   if (!target) return;
   target.classList.remove('msg-flash');
-  void target.offsetWidth;
+  void target.offsetWidth;  // 强制重排，使动画可以重新触发
   target.classList.add('msg-flash');
   setTimeout(() => target.classList.remove('msg-flash'), 1200);
 }
@@ -517,6 +536,8 @@ function getScrollContainer(el) {
   return null;
 }
 
+// 等待滚动动画稳定后再触发消息闪烁效果。
+// 用 rAF 轮询而非固定 setTimeout，快速滚动时不会提前触发。
 function flashAfterScrollSettles(target) {
   const scroller = getScrollContainer(target);
   if (!scroller) {
@@ -601,6 +622,7 @@ function renderViewer(session) {
         </div>
         <div class="viewer-meta">
           <span class="badge badge-${esc(session.source || 'claude')} badge-mini">${esc(session.source || 'claude').toUpperCase()}</span>
+          ${fmtOrigin(session.originSource) ? `<span class="origin-label">${esc(fmtOrigin(session.originSource))}</span>` : ''}
           ${ts} · ${fmtK(totalTok)} tokens · $${(session.totalCost||0).toFixed(4)} ·
           ${(session.models||[]).map(m => esc(m.replace(/^claude-/,''))).join(', ')}
         </div>
@@ -819,7 +841,7 @@ async function runSearch(query) {
     const data = await fetch(`/api/search?q=${encodeURIComponent(query)}`).then(r => r.json());
     const serverResults = data.results || [];
 
-    // Also search local custom names (not already in server results)
+    // 服务端搜索消息内容；本地额外搜索自定义标题（服务端不存储自定义名称）
     const serverIds = new Set(serverResults.map(r => `${r.source || 'claude'}::${r.id}`));
     const q = query.toLowerCase();
     const localMatches = [];
@@ -871,6 +893,7 @@ function renderSearchResults(results, query) {
         <div class="search-result-project">${esc(r.projectName)}</div>
         <div class="search-result-title">
           <span class="badge badge-${esc(r.source || 'claude')} badge-mini">${esc(r.source || 'claude').toUpperCase()}</span>
+          ${fmtOrigin(r.originSource) ? `<span class="origin-label">${esc(fmtOrigin(r.originSource))}</span>` : ''}
           ${highlight(displayTitle)}
         </div>
         ${r.snippets.map(s =>

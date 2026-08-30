@@ -1,6 +1,10 @@
 // aggregators/normalize.js
+// 将 ccusage（Claude）和 @ccusage/codex 的原始输出合并成统一的 UsageReport 结构。
+// 对外暴露两个入口：
+//   buildReportFromCLI     — 1d / 3d / 7d / custom（数据来自 ccusage CLI）
+//   buildReportFromHourly  — 5h（数据来自直读 JSONL，使用小时分桶）
 
-/** ccusage daily entry → our daily row (claude side) */
+/** ccusage 每日条目 → 内部 daily 行（claude 字段） */
 function normalizeClaudeDaily(raw) {
   if (!raw?.daily) return [];
   return raw.daily.map(d => ({
@@ -15,7 +19,7 @@ function normalizeClaudeDaily(raw) {
   }));
 }
 
-/** @ccusage/codex date string "Apr 08, 2026" → "YYYY-MM-DD" */
+/** @ccusage/codex 日期字符串 "Apr 08, 2026" → "YYYY-MM-DD" */
 function parseCodexDate(str) {
   if (typeof str !== 'string') throw new Error(`parseCodexDate: invalid input "${str}"`);
   if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
@@ -35,7 +39,7 @@ function parseCodexDate(str) {
   return `${m[3]}-${month}-${day}`;
 }
 
-/** codex daily entry → our daily row (codex side) */
+/** codex 每日条目 → 内部 daily 行（codex 字段） */
 function normalizeCodexDaily(raw) {
   if (!raw?.daily) return [];
   return raw.daily.map(d => ({
@@ -50,7 +54,7 @@ function normalizeCodexDaily(raw) {
   }));
 }
 
-/** Merge claude + codex daily arrays keyed by date */
+/** 以日期为 key 合并 Claude + Codex 每日数组，某天只有一方数据时另一方为 null */
 function mergeDailyArrays(claudeRows, codexRows) {
   const map = new Map();
   for (const r of claudeRows) map.set(r.date, { date: r.date, claude: r.claude, codex: null });
@@ -83,6 +87,8 @@ function sumCodex(a, b) {
   };
 }
 
+// 对 '1d' 时间段，ccusage 可能因跨午夜返回多行，将它们压缩为一行。
+// 日期取最新，数据累加，确保图表只显示一根柱子。
 function squashDailyFor1d(daily) {
   if (!Array.isArray(daily) || daily.length <= 1) return daily;
   const latestDate = daily.reduce((max, r) => (r.date > max ? r.date : max), daily[0].date);
@@ -93,7 +99,7 @@ function squashDailyFor1d(daily) {
   return [{ date: latestDate, claude: merged.claude, codex: merged.codex }];
 }
 
-/** Build models list from ccusage modelBreakdowns + codex models */
+/** 从 ccusage modelBreakdowns + codex models 构建模型列表，按费用降序排列 */
 function buildModels(claudeRaw, codexRaw) {
   const map = {};
   for (const day of (claudeRaw?.daily || [])) {
@@ -119,7 +125,7 @@ function buildModels(claudeRaw, codexRaw) {
   return models.map(m => ({ ...m, pct: totalCost > 0 ? (m.cost / totalCost * 100).toFixed(1) : '0' }));
 }
 
-/** Build summary totals from merged daily rows */
+/** 从合并后的每日行汇总全局 token 和费用，分别记录 Claude 和 Codex 贡献 */
 function buildSummary(daily) {
   let inputTokens = 0, outputTokens = 0;
   let cacheCreationTokens = 0, cacheReadTokens = 0;
@@ -170,14 +176,21 @@ function lastPathSegment(value) {
   return parts[parts.length - 1] || '';
 }
 
+// 从 ccusage 会话记录推断真实的 session UUID。
+// ccusage 有时将 UUID 放在 projectPath 末尾而非 sessionId 字段（按项目聚合时）。
 function deriveClaudeSessionId(session) {
   const sid = String(session?.sessionId || '').trim();
   if (CLAUDE_UUID_RE.test(sid)) return sid;
   const tail = lastPathSegment(session?.projectPath);
   if (CLAUDE_UUID_RE.test(tail)) return tail;
+  // ccusage session --json returns project-dir paths (e.g. "-Users-ting-Documents-…")
+  // as sessionId when it aggregates by project rather than individual session.
+  // Accept any non-empty ID so project-level rows still appear in the session list.
+  if (sid) return sid;
   return '';
 }
 
+// 从 ccusage 会话记录提取编码后的项目目录名（如 "-Users-ting-Documents-proj"）。
 function deriveClaudeProjectDir(session, resolvedSessionId) {
   const byPath = firstProjectSegment(session?.projectPath);
   if (byPath) return byPath;
@@ -191,6 +204,8 @@ function deriveClaudeProjectDir(session, resolvedSessionId) {
   return '';
 }
 
+// 将 ccusage session 输出规范化为内部 session 对象列表。
+// 过滤掉无法映射到具体 UUID 的项目聚合行（它们没有对应的 JSONL 文件可跳转）。
 function normalizeClaudeSessions(raw) {
   if (!raw?.sessions) return [];
   return raw.sessions
@@ -212,7 +227,7 @@ function normalizeClaudeSessions(raw) {
     .filter((s) => !!s.id);
 }
 
-/** Normalize @ccusage/codex session output */
+/** @ccusage/codex session 输出 → 内部 session 对象列表 */
 function normalizeCodexSessions(raw) {
   if (!raw?.sessions) return [];
   return raw.sessions.map(s => ({
@@ -230,12 +245,17 @@ function normalizeCodexSessions(raw) {
 
 /**
  * Build UsageReport from ccusage + codex CLI output (1d / 3d / 7d / custom).
+ * claudeSessions may be either a raw ccusage object (normalized here) or an
+ * already-normalized array (from readClaudeUsageSince — passed through as-is).
  */
 export function buildReportFromCLI({ period, claudeDaily, codexDaily, claudeSessions, codexSessions }) {
   const mergedDaily = mergeDailyArrays(normalizeClaudeDaily(claudeDaily), normalizeCodexDaily(codexDaily));
   const daily = period === '1d' ? squashDailyFor1d(mergedDaily) : mergedDaily;
+  const claudeList = Array.isArray(claudeSessions)
+    ? claudeSessions
+    : normalizeClaudeSessions(claudeSessions);
   const sessions = [
-    ...normalizeClaudeSessions(claudeSessions),
+    ...claudeList,
     ...normalizeCodexSessions(codexSessions)
   ].sort((a, b) => new Date(b.lastActivity) - new Date(a.lastActivity));
 
@@ -258,6 +278,7 @@ export function buildReportFromHourly({ period, claudeHourly, codexHourly = { su
   const codexSummary = codexHourly?.summary || {};
   const totalCost = (claudeSummary.totalCost || 0) + (codexSummary.totalCost || 0);
 
+  // 合并 Claude 和 Codex 的小时分桶，同一小时的数据合入同一行
   const byLabel = new Map();
   for (const h of (claudeHourly.hourlyBuckets || [])) {
     byLabel.set(h.label, {

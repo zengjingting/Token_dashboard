@@ -1,3 +1,6 @@
+// readers/codex-chat-reader.js
+// 解析 Codex JSONL 会话文件，供 History 标签页使用。
+// Codex 使用不同于 Claude Code 的事件格式：response_item / event_msg / turn_context。
 import { readFileSync, readdirSync, existsSync, unlinkSync, rmdirSync } from 'node:fs';
 import { join, relative, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -6,6 +9,8 @@ import { decodeDirName } from './chat-reader.js';
 const DEFAULT_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
 function sessionsDir() { return process.env.CODEX_SESSIONS_DIR || DEFAULT_SESSIONS_DIR; }
 
+// 将工作目录路径（如 "/Users/ting/proj"）转为编码目录名（"-Users-ting-proj"），
+// 与 chat-reader.js 的格式对齐，使两侧可以共享项目合并逻辑。
 function cwdToEncodedDir(cwd) {
   if (!cwd) return null;
   return '-' + cwd.replace(/^\//, '').replace(/\//g, '-');
@@ -16,12 +21,15 @@ function parseLine(line) {
   try { return JSON.parse(line); } catch { return null; }
 }
 
+// 将文件绝对路径转为相对 session ID（去掉 baseDir 前缀和 .jsonl 后缀）。
+// Codex 会话可嵌套在子目录中，所以 ID 形如 "subdir/uuid"。
 function toSessionId(baseDir, filePath) {
   const rel = relative(baseDir, filePath);
   if (!rel || rel.startsWith('..')) return null;
   return rel.replace(/\.jsonl$/, '').split(sep).join('/');
 }
 
+// 将 session ID 还原为绝对文件路径，拒绝含路径穿越字符的 ID（安全防护）。
 function toSessionFilePath(sessionId) {
   if (typeof sessionId !== 'string' || !sessionId) return null;
   if (sessionId.startsWith('/') || sessionId.includes('\\')) return null;
@@ -31,6 +39,8 @@ function toSessionFilePath(sessionId) {
   return `${join(sessionsDir(), ...parts)}.jsonl`;
 }
 
+// 删除会话文件后，向上逐级清理现在为空的父目录，直到 rootDir 为止。
+// 避免 ~/.codex/sessions/ 下因删除会话而遗留空目录。
 function cleanupEmptyParents(filePath, rootDir) {
   let current = dirname(filePath);
   while (current && current !== rootDir && current.startsWith(`${rootDir}${sep}`)) {
@@ -50,6 +60,8 @@ function cleanupEmptyParents(filePath, rootDir) {
   }
 }
 
+// 读取并解析单个 Codex JSONL 会话文件。
+// 通过 response_item 事件重建对话，token 统计来自 event_msg(token_count) 事件。
 export function parseCodexSessionFile(filePath) {
   const lines = readFileSync(filePath, 'utf-8').split('\n');
   const messages = [];
@@ -61,6 +73,7 @@ export function parseCodexSessionFile(filePath) {
   let cacheTokens = 0;
   let lastActivity = null;
   let cwd = null;
+  let originSource = '';
 
   for (const line of lines) {
     const entry = parseLine(line);
@@ -73,6 +86,7 @@ export function parseCodexSessionFile(filePath) {
 
     if (entry.type === 'session_meta') {
       cwd = entry.payload?.cwd || cwd;
+      originSource = entry.payload?.originator || originSource;
       continue;
     }
 
@@ -103,6 +117,7 @@ export function parseCodexSessionFile(filePath) {
         for (const block of contentBlocks) {
           if (p.role === 'user' && block.type === 'input_text') {
             const text = (block.text || '').trim();
+            // 跳过空内容和 Codex 注入的环境上下文块
             if (!text || text.startsWith('<environment_context>')) continue;
             messages.push({ role: 'user', type: 'text', content: text });
           } else if (p.role === 'assistant' && block.type === 'output_text') {
@@ -166,10 +181,12 @@ export function parseCodexSessionFile(filePath) {
     totalCost: 0,
     models: [...modelsSet],
     lastActivity,
-    cwd
+    cwd,
+    originSource
   };
 }
 
+// 递归查找目录下所有 .jsonl 文件。
 function getAllJsonlFiles(dir) {
   const results = [];
   try {
@@ -184,6 +201,7 @@ function getAllJsonlFiles(dir) {
   return results;
 }
 
+// 取第一条长度大于 5 的 user 文本消息作为会话标题。
 function extractTitle(messages) {
   for (const msg of messages) {
     if (msg.role === 'user' && msg.type === 'text' && msg.content?.trim().length > 5) {
@@ -193,6 +211,7 @@ function extractTitle(messages) {
   return 'Untitled';
 }
 
+// 返回所有 Codex 会话，以会话的工作目录为依据分组成项目，按最近活动排序。
 export function listCodexSessions() {
   const dir = sessionsDir();
   if (!existsSync(dir)) return { projects: [] };
@@ -215,6 +234,7 @@ export function listCodexSessions() {
         id: relId,
         projectDir: encodedDir,
         source: 'codex',
+        originSource: parsed.originSource || '',
         title: extractTitle(parsed.messages),
         lastActivity: parsed.lastActivity || new Date(0).toISOString(),
         messageCount: parsed.messages.length,
@@ -242,6 +262,7 @@ export function listCodexSessions() {
   return { projects };
 }
 
+// 通过相对 session ID 读取 Codex 会话的完整消息内容。
 export function readCodexSession(sessionId) {
   const filePath = toSessionFilePath(sessionId);
   if (!filePath) return null;
@@ -252,6 +273,7 @@ export function readCodexSession(sessionId) {
     id: sessionId,
     projectDir: cwdToEncodedDir(parsed.cwd) || 'codex',
     source: 'codex',
+    originSource: parsed.originSource || '',
     title: extractTitle(parsed.messages),
     messages: parsed.messages,
     inputTokens: parsed.inputTokens,
@@ -263,6 +285,7 @@ export function readCodexSession(sessionId) {
   };
 }
 
+// 永久删除 Codex 会话文件，并清理因此产生的空父目录。
 export function deleteCodexSession(sessionId) {
   const filePath = toSessionFilePath(sessionId);
   if (!filePath) return false;
@@ -277,6 +300,7 @@ export function deleteCodexSession(sessionId) {
   }
 }
 
+// 在所有 Codex 会话消息中全文搜索，返回含上下文片段的匹配结果，按最近活动排序。
 export function searchCodexSessions(query) {
   if (!query?.trim()) return { query: query || '', results: [] };
   const dir = sessionsDir();
@@ -311,6 +335,7 @@ export function searchCodexSessions(query) {
           id: relId,
           projectDir: encodedDir,
           source: 'codex',
+          originSource: parsed.originSource || '',
           projectName: decodeDirName(encodedDir),
           title: extractTitle(parsed.messages),
           lastActivity: parsed.lastActivity || '',

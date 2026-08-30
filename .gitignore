@@ -140,3 +140,4 @@ vite.config.ts.timestamp-*
 
 .worktrees
 .DS_Store
+.claude/settings.local.json

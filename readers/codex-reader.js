@@ -1,9 +1,13 @@
+// readers/codex-reader.js
+// 直接读取 ~/.codex/sessions/**/*.jsonl，聚合 Codex token 用量。
+// 仅用于 5h 时间段（其他时间段由 cli-runner.js 调用 ccusage-codex CLI）。
 import { readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
 const SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
 
+// 递归查找目录下所有 .jsonl 文件（每个文件对应一个 Codex 会话）。
 function getAllJsonlFiles(dir) {
   const results = [];
   try {
@@ -18,11 +22,13 @@ function getAllJsonlFiles(dir) {
   return results;
 }
 
+// 将时间戳转为 "YYYY-MM-DDTHH" 格式的小时分桶 key。
 function toHourKey(ts) {
   const d = new Date(ts);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}T${String(d.getHours()).padStart(2, '0')}`;
 }
 
+// 返回全零的 summary 对象，避免重复字面量。
 function makeEmptySummary() {
   return {
     inputTokens: 0,
@@ -35,8 +41,9 @@ function makeEmptySummary() {
 }
 
 /**
- * Read Codex usage entries since a given timestamp (ms).
- * Data source: ~/.codex/sessions/*.jsonl token_count(last_token_usage) events.
+ * 扫描 ~/.codex/sessions/ 下所有 JSONL，聚合 sinceMs 之后的 token 用量。
+ * 数据来源：每条 event_msg(token_count) 事件中的 last_token_usage 字段。
+ * 返回：summary 总计 + 按模型分组 + 按会话分组 + 按小时分桶（用于 5h 图表）。
  */
 export function readCodexUsageSince(sinceMs) {
   const files = getAllJsonlFiles(SESSIONS_DIR);
@@ -52,6 +59,7 @@ export function readCodexUsageSince(sinceMs) {
     } catch {
       continue;
     }
+    // 跳过修改时间早于窗口的文件（+1h 缓冲，与 claude-reader.js 保持一致）
     if (stat.mtimeMs < sinceMs - 3_600_000) continue;
 
     const relId = file.replace(`${SESSIONS_DIR}/`, '').replace(/\.jsonl$/, '');
@@ -67,10 +75,12 @@ export function readCodexUsageSince(sinceMs) {
         continue;
       }
 
+      // turn_context 事件携带本次会话使用的模型名
       if (entry?.type === 'turn_context' && entry?.payload?.model) {
         sessionModel = entry.payload.model;
       }
 
+      // 只处理 token_count 类型的事件，跳过其他所有行
       if (!(entry?.type === 'event_msg' && entry?.payload?.type === 'token_count')) continue;
       const usage = entry?.payload?.info?.last_token_usage;
       if (!usage) continue;

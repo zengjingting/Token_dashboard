@@ -1,3 +1,7 @@
+// readers/chat-reader.js
+// 解析 Claude Code JSONL 会话文件，供 History 标签页使用。
+// 功能覆盖：列举项目/会话、读取完整对话内容、全文搜索、删除会话、
+// 项目统计聚合（token + 费用）、活动热力图数据。
 import { readFileSync, readdirSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -20,6 +24,7 @@ function fetchCcusageSessions() {
   }
 }
 
+// 路径中常见的无意义片段，解码目录名时跳过它们
 const SKIP_PATH_SEGMENTS = new Set([
   'users',
   'home',
@@ -33,6 +38,7 @@ const SKIP_PATH_SEGMENTS = new Set([
   'local'
 ]);
 
+// 解析单行 JSONL，失败返回 null。
 function parseLine(line) {
   if (!line.trim()) return null;
   try {
@@ -42,6 +48,9 @@ function parseLine(line) {
   }
 }
 
+// 将编码后的项目目录名（如 "-Users-ting-Documents-MyProject"）还原为可读标签。
+// 逻辑：去掉 OS 根目录前缀（/users/<name>、/home/<name> 等），再去掉常见无意义路径片段，
+// 保留最后有意义的部分作为显示名。
 export function decodeDirName(dirName) {
   const parts = dirName.replace(/^-/, '').split('-').filter(Boolean);
 
@@ -66,6 +75,7 @@ export function decodeDirName(dirName) {
   return result || dirName;
 }
 
+// 取第一条长度大于 5 的 user 文本消息作为会话标题，找不到则返回 'Untitled'。
 function extractTitle(messages) {
   for (const msg of messages) {
     if (msg.role === 'user' && msg.type === 'text' && msg.content?.trim().length > 5) {
@@ -75,6 +85,8 @@ function extractTitle(messages) {
   return 'Untitled';
 }
 
+// 读取并解析单个 Claude JSONL 会话文件。
+// 提取：user/assistant 文本消息、工具调用与结果、token 统计、费用、模型列表、最后活动时间。
 export function parseSessionFile(filePath) {
   const lines = readFileSync(filePath, 'utf-8').split('\n');
   const messages = [];
@@ -86,10 +98,13 @@ export function parseSessionFile(filePath) {
   let totalCost = 0;
   const modelsSet = new Set();
   let lastActivity = null;
+  let originSource = '';
 
   for (const line of lines) {
     const entry = parseLine(line);
-    if (!entry || entry.isMeta) continue;
+    if (!entry) continue;
+    if (!originSource && entry.entrypoint) originSource = entry.entrypoint;
+    if (entry.isMeta) continue;
 
     const ts = entry.timestamp;
     if (ts && (!lastActivity || ts > lastActivity)) {
@@ -166,10 +181,13 @@ export function parseSessionFile(filePath) {
     cacheTokens,
     totalCost,
     models: [...modelsSet],
-    lastActivity
+    lastActivity,
+    originSource
   };
 }
 
+// 返回所有 Claude 项目及其会话摘要（不含消息内容），按最近活动时间排序。
+// 供 History 标签页左侧项目/会话列表使用。
 export function listSessions() {
   if (!existsSync(projectsDir())) return { projects: [] };
 
@@ -195,6 +213,7 @@ export function listSessions() {
           id: sessionId,
           projectDir: dir.name,
           source: 'claude',
+          originSource: parsed.originSource || '',
           title: extractTitle(parsed.messages),
           lastActivity: parsed.lastActivity || new Date(0).toISOString(),
           messageCount: parsed.messages.length,
@@ -223,6 +242,7 @@ export function listSessions() {
   return { projects };
 }
 
+// 读取指定项目目录下某个会话的完整消息内容。
 export function readSession(projectDir, sessionId) {
   const filePath = join(projectsDir(), projectDir, `${sessionId}.jsonl`);
   if (!existsSync(filePath)) return null;
@@ -231,6 +251,8 @@ export function readSession(projectDir, sessionId) {
   return {
     id: sessionId,
     projectDir,
+    source: 'claude',
+    originSource: parsed.originSource || '',
     title: extractTitle(parsed.messages),
     messages: parsed.messages,
     inputTokens: parsed.inputTokens,
@@ -242,6 +264,8 @@ export function readSession(projectDir, sessionId) {
   };
 }
 
+// 在不知道 projectDir 的情况下，遍历所有项目目录查找会话。
+// 当从 URL 参数或 SSE 消息中只拿到 sessionId 时使用。
 export function readSessionById(sessionId) {
   if (!sessionId || /[./\\]/.test(sessionId)) return null;
   if (!existsSync(projectsDir())) return null;
@@ -255,6 +279,7 @@ export function readSessionById(sessionId) {
   return null;
 }
 
+// 永久删除会话 JSONL 文件。路径中含 ./\ 时拒绝执行（防路径穿越）。
 export function deleteSession(projectDir, sessionId) {
   if (!projectDir || !sessionId) return false;
   if (/[./\\]/.test(projectDir) || /[./\\]/.test(sessionId)) return false;
@@ -270,6 +295,7 @@ export function deleteSession(projectDir, sessionId) {
   }
 }
 
+// 在所有会话的消息文本中全文搜索，返回含上下文片段的匹配列表，按最近活动排序。
 export function searchSessions(query) {
   if (!query?.trim()) return { query: query || '', results: [] };
   if (!existsSync(projectsDir())) return { query, results: [] };
@@ -310,6 +336,7 @@ export function searchSessions(query) {
             id: sessionId,
             projectDir: dir.name,
             source: 'claude',
+            originSource: parsed.originSource || '',
             projectName: decodeDirName(dir.name),
             title: extractTitle(parsed.messages),
             lastActivity: parsed.lastActivity || '',
@@ -326,6 +353,9 @@ export function searchSessions(query) {
   return { query, results };
 }
 
+// 构建每个项目的 token + 费用统计。
+// token 来自本地 JSONL 扫描（始终可用）；费用来自 ccusage CLI（准确的历史账单）。
+// 两个数据源通过 projectDir 编码名关联，同一项目的多个 ccusage 条目全部累加（子代理会话不去重）。
 export function getProjectStats() {
   const dir = projectsDir();
   if (!existsSync(dir)) return [];
@@ -383,6 +413,7 @@ export function getProjectStats() {
   return [...byDir.values()].sort((a, b) => b.totalCost - a.totalCost);
 }
 
+// 扫描所有会话文件，返回 sinceMs 之后每天的 token + 费用统计，供活动热力图使用。
 export function getDailyActivity(sinceMs) {
   if (!existsSync(projectsDir())) return [];
 
